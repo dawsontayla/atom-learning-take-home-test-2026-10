@@ -3,6 +3,22 @@ select table_name, column_name, data_type from `atom-analytics-candidates.de_raw
 order by table_name, ordinal_position;
 
 
+-- Distinct subjects
+select distinct subject_name from `atom-analytics-candidates.de_raw.course_hierarchy`;
+
+-- 1   Non-Verbal Reasoning
+-- 2	Wellbeing
+-- 3	English
+-- 4	Science
+-- 5	Maths
+-- 6	Verbal Reasoning
+-- 7	Screeners
+
+-- Links:
+-- https://www.gov.uk/government/publications/key-stage-2-tests-2026-scaled-scores
+-- https://www.gov.uk/government/publications/key-stage-2-tests-2025-scaled-scores
+
+
 -- =====================================================================
 -- 1. Table inventory: row counts, size, freshness (metadata only, no table scan)
 -- =====================================================================
@@ -291,3 +307,49 @@ select
 from response_keys as rk
 group by found_in_sittings, key_pattern
 order by found_in_sittings, n_keys desc;
+
+
+--- 9. Checking for mismatched pupil IDs
+SELECT
+  COUNT(*) AS total_joined_responses,
+  COUNTIF(r.pupil_id = s.pupil_id) AS matching_pupil_ids,
+  COUNTIF(r.pupil_id != s.pupil_id) AS mismatched_pupil_ids,
+  ROUND(100 * COUNTIF(r.pupil_id != s.pupil_id) / COUNT(*), 4) AS pct_mismatched
+FROM `atom-analytics-candidates.de_raw.responses` r
+JOIN `atom-analytics-candidates.de_raw.assessment_sittings` s
+  ON r.session_id = s.session_id;
+
+
+
+--- 10. Column names: 
+-- Column names:
+-- Row	table_name	column_name	data_type
+-- 1	assessment_sittings	session_id	STRING
+-- 2	assessment_sittings	pupil_id	STRING
+-- 3	assessment_sittings	assessment_id	STRING
+-- 4	assessment_sittings	session_type	STRING
+-- 5	assessment_sittings	style	STRING
+-- 6	assessment_sittings	year_group_at_sitting	INT64
+-- 7	assessment_sittings	total_questions	INT64
+-- 8	assessment_sittings	is_complete	BOOL
+-- 9	assessment_sittings	is_deleted	BOOL
+-- 10	assessment_sittings	started_at	TIMESTAMP
+-- 11	assessment_sittings	finished_at	TIMESTAMP
+-- 12	course_hierarchy	question_id	STRING
+-- 13	course_hierarchy	atom_id	STRING
+-- 14	course_hierarchy	subtopic_id	STRING
+-- 15	course_hierarchy	topic_id	STRING
+-- 16	course_hierarchy	subject_id	STRING
+-- 17	course_hierarchy	subject_name	STRING
+-- 18	pupils	pupil_id	STRING
+-- 19	pupils	is_deleted	BOOL
+-- 20	responses	response_id	STRING
+-- 21	responses	pupil_id	STRING
+-- 22	responses	session_id	STRING
+-- 23	responses	session_type	STRING
+-- 24	responses	question_id	STRING
+-- 25	responses	is_correct	BOOL
+-- 26	responses	is_no_attempt	BOOL
+-- 27	responses	seconds_taken	INT64
+-- 28	responses	question_number	INT64
+-- 29	responses	answered_at	TIMESTAMP
