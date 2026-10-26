@@ -85,6 +85,14 @@ work. Tell us what you would need to build that - what data, what assumptions an
 few paragraphs is a complete answer`
 
 
+### Data requirements
+- Plenty of prior attainment data (both primary school and GCSE) of students from diverse academic backgrounds.
+- Data scaling used at both levels.
+
+### Assumptions
+-The curriculum remains the same. Mastery is approximately measured by demonstable comprehension of the same topics.
+
+### Approach
 
 
 
@@ -97,3 +105,5 @@ few paragraphs is a complete answer`
 - Created a lookup table of subjects to reference against, replacing the hard-coded subject name exclusions.
 - Added automated data quality tests, for example key uniqueness, orphan checks and score range checks.
 - Spent more time testing the output.
+- Removed more of the superfluous AI comments.
+- Implemented different schematic layets/tables (rather than CTEs) for the cleaning-aggreagating-scaling process.

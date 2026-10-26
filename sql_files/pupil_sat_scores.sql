@@ -43,7 +43,7 @@ options (
 );
 
 
-begin transaction;
+begin transaction; -- to allow rollback
 
 -- Replace exactly one partition: delete it, then rewrite it.
 delete from `atom-analytics-candidates.tayla_dawson.pupil_sat_scores`
