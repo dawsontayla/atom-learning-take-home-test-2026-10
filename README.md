@@ -86,20 +86,22 @@ few paragraphs is a complete answer`
 
 
 ### Data requirements
-- Plenty of prior attainment data (both primary school and GCSE) of students from diverse academic backgrounds.
-- Data scaling used at both levels.
+- Plenty of prior attainment data of students from diverse academic backgrounds.
+- Any data scaling metric used at either levels.
+- Continuous stream of engagemen data from the platform.
 
 ### Assumptions
 -The curriculum remains the same. Mastery is approximately measured by demonstable comprehension of the same topics.
+- Non-linear student learning trajectories.
 
 ### Approach
-
-
+Due to the assumtion of non-linear learning, I would use Bayesian updating as my underpinning method. I would use historical data of a student's KS2 results as a baseline for the model and the continuous activity on the platform as observation data. This approach allows for a continuously updating distribution system to model. Snapshotting would be maintained to prevent any look-ahead bias.
 
 
 ## What I would have done with more time
 - Provided more specific details on the DQIs and sample queries to view them (rather than attaching IDs to the README).
 - Visually fleshed out the architecture further using a tool like Excalidraw or Lucidchart.
+- More detailed answer to Step 3.
 - Explored more optimisation techniques for columnar data.
 - Materialised each layer as its own table or view, and moved scale parameters into a config table.
 - Created a lookup table of subjects to reference against, replacing the hard-coded subject name exclusions.

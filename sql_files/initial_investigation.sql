@@ -353,3 +353,16 @@ JOIN `atom-analytics-candidates.de_raw.assessment_sittings` s
 -- 27	responses	seconds_taken	INT64
 -- 28	responses	question_number	INT64
 -- 29	responses	answered_at	TIMESTAMP
+
+
+--- 11. Post-change querying example
+
+-- To check that this query gets blocked to avoid full table scans
+-- select * from `atom-analytics-candidates.tayla_dawson.pupil_sat_scores` 
+-- limit 50;
+
+
+-- select * from `atom-analytics-candidates.tayla_dawson.pupil_sat_scores` 
+-- where snapshot_date > '2025-11-21'
+-- and subject_name != 'English'
+-- limit 50;
