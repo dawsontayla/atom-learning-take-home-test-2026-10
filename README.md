@@ -87,15 +87,16 @@ few paragraphs is a complete answer`
 
 ### Data requirements
 - Plenty of prior attainment data of students from diverse academic backgrounds.
-- Any data scaling metric used at either levels.
-- Continuous stream of engagemen data from the platform.
+- Any data scaling metric used.
+- Continuous stream of engagement data from the platform.
+- Published DfE Progress 8 and Attainment 8 benchmarks, to use as the prior.
 
 ### Assumptions
--The curriculum remains the same. Mastery is approximately measured by demonstable comprehension of the same topics.
+- The curriculum will not stay identical, but the topics that distinguish upper-end attainment are largely stable over time. Mastery is approximately measured by demonstrable comprehension of those core topics, so the model leans on them rather than on the full curriculum.
 - Non-linear student learning trajectories.
 
 ### Approach
-Due to the assumtion of non-linear learning, I would use Bayesian updating as my underpinning method. I would use historical data of a student's KS2 results as a baseline for the model and the continuous activity on the platform as observation data. This approach allows for a continuously updating distribution system to model. Snapshotting would be maintained to prevent any look-ahead bias.
+Due to the assumption of non-linear learning, I would use Bayesian updating as my underpinning method. I would use historical data of a student's KS2 results as a baseline for the model and the continuous activity on the platform as observation data. The prior would come from the published DfE Progress 8 and Attainment 8 benchmarks, which describe typical KS2-to-GCSE progress, so the model is usable before enough of our own pupils have reached GCSE. It would then be calibrated against our own cohorts as their outcomes arrive. This approach allows for a continuously updating distribution system to model. Snapshotting would be maintained to prevent any look-ahead bias.
 
 
 ## What I would have done with more time

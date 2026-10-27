@@ -1,0 +1,1073 @@
+
+> <ide_opened_file>The user opened the file
+  c:\Users\tayla\OneDrive\Documents\GitZone\atom-learning-take-home-test-2026-1
+  0\sql_files\initial_investigation.sql in the IDE. This may or may not be
+  related to the current task.</ide_opened_file>
+
+> You are a lead data engineer pair-programming with me. Write clean, modular
+  code. Do not make silent architectural decisions without consulation. The
+  same applies to speed and memory efficiency evaluations. As part of my
+  @sql_files/initial_investigation.sql I would like to inspect each table for
+  data quality issues, foreign key integrity, null and timestamp handling.
+  Please give the BQ queries that will let me inspect this quickly. Other
+  tables in the same schema are  responses, assessment_sittings,
+  course_hierarchy, and pupils.
+  ⎿  Read sql_files\initial_investigation.sql (5 lines)
+
+● Write(sql_files\initial_investigation.sql)
+  ⎿  Added 197 lines
+        2  select table_name, column_name, data_type from `atom-analytics
+           -candidates.de_raw.INFORMATION_SCHEMA.COLUMNS`
+        3  order by table_name, ordinal_position;
+        4  
+        5 +                                                              
+        6 +-- ===========================================================
+          +==========                                                    
+        7 +-- 1. Table inventory: row counts, size, freshness (metadata o
+          +nly, no table scan)                                           
+        8 +-- ===========================================================
+          +==========                                                    
+        9 +select                                                        
+       10 +  table_id as table_name,                                     
+       11 +  row_count,                                                  
+       12 +  round(size_bytes / pow(1024, 2), 2) as size_mb,             
+       13 +  timestamp_millis(creation_time) as created_at,              
+       14 +  timestamp_millis(last_modified_time) as last_modified_at,   
+       15 +  if(type = 1, 'TABLE', 'VIEW') as table_type                 
+       16 +from `atom-analytics-candidates.de_raw.__TABLES__`            
+       17 +order by table_name;                                          
+       18 +                                                              
+       19 +                                                              
+       20 +-- ===========================================================
+          +==========                                                    
+       21 +-- 2. Null profile for every column in every table (one result
+          + set)                                                         
+       22 +--    Builds one UNION ALL query from INFORMATION_SCHEMA, so i
+          +t adapts to schema changes.                                   
+       23 +--    Scans every column once: dry-run first to check bytes bi
+          +lled.                                                         
+       24 +--    ARRAY / STRUCT / JSON / GEOGRAPHY columns are skipped (n
+          +o plain null/distinct semantics).                             
+       25 +-- ===========================================================
+          +==========                                                    
+       26 +declare null_profile_sql string;                              
+       27 +                                                              
+       28 +set null_profile_sql = (                                      
+       29 +  select string_agg(                                          
+       30 +    format(                                                   
+       31 +      "select '%s' as table_name, '%s' as column_name, '%s' as
+          + data_type, count(*) as n_rows, "                             
+       32 +      || "countif(`%s` is null) as n_null, approx_count_distin
+          +ct(`%s`) as approx_n_distinct "                               
+       33 +      || "from `atom-analytics-candidates.de_raw.%s`",        
+       34 +      table_name, column_name, data_type, column_name, column_
+          +name, table_name                                              
+       35 +    ),                                                        
+       36 +    ' union all '                                             
+       37 +  )                                                           
+       38 +  from `atom-analytics-candidates.de_raw.INFORMATION_SCHEMA.CO
+          +LUMNS`                                                        
+       39 +  where data_type not like 'ARRAY%'                           
+       40 +    and data_type not like 'STRUCT%'                          
+       41 +    and data_type not in ('JSON', 'GEOGRAPHY')                
+       42 +);                                                            
+       43 +                                                              
+       44 +execute immediate                                             
+       45 +  "select *, round(100 * safe_divide(n_null, n_rows), 2) as pc
+          +t_null from ("                                                
+       46 +  || null_profile_sql                                         
+       47 +  || ") order by table_name, column_name";                    
+       48 +                                                              
+       49 +                                                              
+       50 +-- ===========================================================
+          +==========                                                    
+       51 +-- 3. Disguised nulls in STRING columns: blanks, sentinel text
+          +, padding                                                     
+       52 +-- ===========================================================
+          +==========                                                    
+       53 +declare string_profile_sql string;                            
+       54 +                                                              
+       55 +set string_profile_sql = (                                    
+       56 +  select string_agg(                                          
+       57 +    format(                                                   
+       58 +      "select '%s' as table_name, '%s' as column_name, "      
+       59 +      || "countif(trim(`%s`) = '') as n_blank, "              
+       60 +      || "countif(lower(trim(`%s`)) in ('null', 'none', 'n/a',
+          + 'na', 'nan', 'undefined', '-')) as n_sentinel_text, "        
+       61 +      || "countif(`%s` != trim(`%s`)) as n_padded "           
+       62 +      || "from `atom-analytics-candidates.de_raw.%s`",        
+       63 +      table_name, column_name, column_name, column_name, colum
+          +n_name, column_name, table_name                               
+       64 +    ),                                                        
+       65 +    ' union all '                                             
+       66 +  )                                                           
+       67 +  from `atom-analytics-candidates.de_raw.INFORMATION_SCHEMA.CO
+          +LUMNS`                                                        
+       68 +  where data_type = 'STRING'                                  
+       69 +);                                                            
+       70 +                                                              
+       71 +execute immediate                                             
+       72 +  "select * from (" || string_profile_sql || ") "             
+       73 +  || "where n_blank + n_sentinel_text + n_padded > 0 order by 
+          +table_name, column_name";                                     
+       74 +                                                              
+       75 +                                                              
+       76 +-- ===========================================================
+          +==========                                                    
+       77 +-- 4a. Timestamp handling: native DATE / DATETIME / TIMESTAMP 
+          +columns                                                       
+       78 +--     Range, future-dated values, implausibly old values, epo
+          +ch-like values.                                               
+       79 +--     NB: DATETIME has no timezone, timestamp(datetime) assum
+          +es UTC.                                                       
+       80 +--     ASSUMPTION: 2000-01-01 is the earliest plausible date. 
+          +Adjust once the domain is clear.                              
+       81 +-- ===========================================================
+          +==========                                                    
+       82 +declare ts_profile_sql string;                                
+       83 +                                                              
+       84 +set ts_profile_sql = (                                        
+       85 +  select string_agg(                                          
+       86 +    format(                                                   
+       87 +      "select '%s' as table_name, '%s' as column_name, '%s' as
+          + data_type, "                                                 
+       88 +      || "cast(min(`%s`) as string) as min_value, cast(max(`%s
+          +`) as string) as max_value, "                                 
+       89 +      || "countif(`%s` is null) as n_null, "                  
+       90 +      || "countif(timestamp(`%s`) > current_timestamp()) as n_
+          +future, "                                                     
+       91 +      || "countif(timestamp(`%s`) < timestamp '2000-01-01') as
+          + n_before_2000, "                                             
+       92 +      || "countif(timestamp(`%s`) < timestamp '1970-01-02') as
+          + n_epoch_like "                                               
+       93 +      || "from `atom-analytics-candidates.de_raw.%s`",        
+       94 +      table_name, column_name, data_type,                     
+       95 +      column_name, column_name, column_name, column_name, colu
+          +mn_name, column_name, table_name                              
+       96 +    ),                                                        
+       97 +    ' union all '                                             
+       98 +  )                                                           
+       99 +  from `atom-analytics-candidates.de_raw.INFORMATION_SCHEMA.CO
+          +LUMNS`                                                        
+      100 +  where data_type in ('DATE', 'DATETIME', 'TIMESTAMP')        
+      101 +);                                                            
+      102 +                                                              
+      103 +execute immediate "select * from (" || ts_profile_sql || ") or
+          +der by table_name, column_name";                              
+      104 +                                                              
+      105 +                                                              
+      106 +-- ===========================================================
+          +==========                                                    
+      107 +-- 4b. Timestamps stored as STRING (name looks temporal): do t
+          +hey parse?                                                    
+      108 +--     safe_cast only accepts ISO-style formats, so unparseabl
+          +e != necessarily bad, but inspect the sample.                 
+      109 +-- ===========================================================
+          +==========                                                    
+      110 +declare str_ts_sql string;                                    
+      111 +                                                              
+      112 +set str_ts_sql = (                                            
+      113 +  select string_agg(                                          
+      114 +    format(                                                   
+      115 +      "select '%s' as table_name, '%s' as column_name, "      
+      116 +      || "countif(`%s` is not null) as n_non_null, "          
+      117 +      || "countif(`%s` is not null and safe_cast(`%s` as times
+          +tamp) is null) as n_unparseable, "                            
+      118 +      || "any_value(if(`%s` is not null and safe_cast(`%s` as 
+          +timestamp) is null, `%s`, null)) as sample_unparseable "      
+      119 +      || "from `atom-analytics-candidates.de_raw.%s`",        
+      120 +      table_name, column_name, column_name, column_name, colum
+          +n_name,                                                       
+      121 +      column_name, column_name, column_name, table_name       
+      122 +    ),                                                        
+      123 +    ' union all '                                             
+      124 +  )                                                           
+      125 +  from `atom-analytics-candidates.de_raw.INFORMATION_SCHEMA.CO
+          +LUMNS`                                                        
+      126 +  where data_type = 'STRING'                                  
+      127 +    and regexp_contains(lower(column_name), r'(date|time|_at$|
+          +_on$|dob|birth)')                                             
+      128 +);                                                            
+      129 +                                                              
+      130 +-- str_ts_sql is null when no column name matches; the guard a
+          +voids executing a null statement.                             
+      131 +execute immediate                                             
+      132 +  ifnull("select * from (" || str_ts_sql || ") order by table_
+          +name, column_name", "select 'no candidate string timestamp col
+          +umns' as note");                                              
+      133 +                                                              
+      134 +                                                              
+      135 +-- ===========================================================
+          +==========                                                    
+      136 +-- 5. Fully duplicated rows per table                         
+      137 +-- ===========================================================
+          +==========                                                    
+      138 +select 'responses' as table_name, count(*) as n_rows, count(di
+          +stinct to_json_string(t)) as n_distinct_rows                  
+      139 +from `atom-analytics-candidates.de_raw.responses` as t        
+      140 +union all                                                     
+      141 +select 'assessment_sittings', count(*), count(distinct to_json
+          +_string(t))                                                   
+      142 +from `atom-analytics-candidates.de_raw.assessment_sittings` as
+          + t                                                            
+      143 +union all                                                     
+      144 +select 'course_hierarchy', count(*), count(distinct to_json_st
+          +ring(t))                                                      
+      145 +from `atom-analytics-candidates.de_raw.course_hierarchy` as t 
+      146 +union all                                                     
+      147 +select 'pupils', count(*), count(distinct to_json_string(t))  
+      148 +from `atom-analytics-candidates.de_raw.pupils` as t;          
+      149 +-- ^ add the 5th table (name not yet known to me; only four we
+          +re listed besides the one you already have)                   
+      150 +                                                              
+      151 +                                                              
+      152 +-- ===========================================================
+          +==========                                                    
+      153 +-- 6. Foreign key candidates: same column name in more than on
+          +e table, flagging type mismatches                             
+      154 +--    (a join on mismatched types fails or silently casts)    
+      155 +-- ===========================================================
+          +==========                                                    
+      156 +select                                                        
+      157 +  column_name,                                                
+      158 +  array_agg(struct(table_name, data_type) order by table_name)
+          + as appears_in,                                               
+      159 +  count(distinct data_type) as n_distinct_types               
+      160 +from `atom-analytics-candidates.de_raw.INFORMATION_SCHEMA.COLU
+          +MNS`                                                          
+      161 +group by column_name                                          
+      162 +having count(distinct table_name) > 1                         
+      163 +order by n_distinct_types desc, column_name;                  
+      164 +                                                              
+      165 +                                                              
+      166 +-- ===========================================================
+          +==========                                                    
+      167 +-- 7a. Key uniqueness: set the table and column, run. Expect n
+          +_rows = n_distinct_keys for a primary key.                    
+      168 +-- ===========================================================
+          +==========                                                    
+      169 +declare key_table string default '<table>';                   
+      170 +declare key_column string default '<key_column>';             
+      171 +                                                              
+      172 +execute immediate replace(replace("""                         
+      173 +select                                                        
+      174 +  count(*) as n_rows,                                         
+      175 +  countif({col} is null) as n_null_keys,                      
+      176 +  count(distinct {col}) as n_distinct_keys,                   
+      177 +  count(*) - countif({col} is null) - count(distinct {col}) as
+          + n_duplicate_key_rows                                         
+      178 +from `atom-analytics-candidates.de_raw.{tbl}`                 
+      179 +""", '{tbl}', key_table), '{col}', key_column);               
+      180 +                                                              
+      181 +                                                              
+      182 +-- ===========================================================
+          +==========                                                    
+      183 +-- 7b. Foreign key integrity (orphans): child.fk must exist in
+          + parent.pk                                                    
+      184 +--     Parent keys are de-duplicated first so a non-unique par
+          +ent key can't inflate child row counts.                       
+      185 +-- ===========================================================
+          +==========                                                    
+      186 +declare child_table string default '<child_table>';           
+      187 +declare child_fk string default '<fk_column>';                
+      188 +declare parent_table string default '<parent_table>';         
+      189 +declare parent_pk string default '<pk_column>';               
+      190 +                                                              
+      191 +execute immediate replace(replace(replace(replace("""         
+      192 +select                                                        
+      193 +  count(*) as n_child_rows,                                   
+      194 +  countif(c.{fk} is null) as n_null_fk,                       
+      195 +  countif(c.{fk} is not null and p.k is null) as n_orphan_rows
+          +,                                                             
+      196 +  count(distinct if(c.{fk} is not null and p.k is null, c.{fk}
+          +, null)) as n_orphan_distinct_keys,                           
+      197 +  array_agg(if(c.{fk} is not null and p.k is null, c.{fk}, nul
+          +l) ignore nulls limit 5) as sample_orphan_keys                
+      198 +from `atom-analytics-candidates.de_raw.{child}` as c          
+      199 +left join (select distinct {pk} as k from `atom-analytics-cand
+          +idates.de_raw.{parent}`) as p                                 
+      200 +  on c.{fk} = p.k                                             
+      201 +""", '{child}', child_table), '{fk}', child_fk), '{parent}', p
+          +arent_table), '{pk}', parent_pk);                             
+
+● I've added the queries to initial_investigation.sql
+  (sql_files/initial_investigation.sql). I haven't run any of them. I also
+  haven't seen your column names, because the first query's output wasn't
+  shared. So the checks that need specific columns are templates for now.
+
+  Checks that need no column names
+  1. Inventory: row count, size, and last-modified time per table, from
+     __TABLES__. This reads metadata only and scans no data.
+  2. Null profile: n_null, pct_null, and approximate distinct count for every
+     column in every table.
+  3. Disguised nulls: blank strings, sentinel text ('null', 'N/A', '-' and
+     similar), and padded whitespace in STRING columns.
+  4. Timestamps:
+     - 4a: for DATE, DATETIME and TIMESTAMP columns, it gives min/max,
+       future-dated values, values before 2000, and epoch-like values.
+     - 4b: for STRING columns with date-like names, it counts values that don't
+       parse as timestamps and shows a sample.
+  5. Duplicate rows: fully duplicated rows per table.
+  6. FK candidates: column names that appear in more than one table, flagging
+     type mismatches between them.
+
+  Checks that need your input
+  - 7a: key uniqueness and null keys. Set the table and column at the top.
+  - 7b: orphan check. Set the child table, FK column, parent table and PK column
+    at the top. The parent keys are de-duplicated first so a duplicated parent
+    key can't inflate the counts.
+
+  Once you run section 6, or paste the column listing, I can fill in the real FK
+  pairs.
+
+  Decisions for you
+  - Dynamic SQL: sections 2–4 build one UNION ALL query from INFORMATION_SCHEMA
+    and run it with EXECUTE IMMEDIATE. That covers every column in one pass and
+    keeps working if the schema changes. The alternative is explicit per-table
+    SQL, which is easier to read but long and brittle. Say if you'd prefer that.
+  - Scan cost: sections 2–5 scan the full tables (section 2 once per column),
+    and I haven't estimated the bytes billed. Please dry-run them first, or tell
+    me the table sizes from section 1 and I'll assess it.
+  - Section 5 gaps: it only covers the four tables you named. Your original
+    table isn't named in this thread, so it needs a fifth UNION ALL branch.
+  - Date threshold: 4a uses 2000-01-01 as the earliest plausible date, which is
+    my assumption. Please confirm or change it.
+  - Generic checks: the sentinel strings in section 3 and the date-like column
+    name pattern in 4b are generic guesses. Tune them once you've seen the data.
+
+> <ide_selection>The user selected the lines 93 to 93 from
+  c:\Users\tayla\OneDrive\Documents\GitZone\atom-learning-take-home-test-2026-1
+  0\sql_files\initial_investigation.sql:
+  "countif(timestamp(%s) < timestamp '1970-01-02') as n_epoch_like "
+
+  This may or may not be related to the current task.</ide_selection>
+
+> explain the purpose for establishing 'epoch-like' values
+
+● Epoch-like values are a common sign of a broken timestamp. Unix time starts at
+  1970-01-01 00:00:00 UTC, and the check counts anything before 1970-01-02.
+
+  Why they show up
+  - Zero or null coerced to 0: an upstream system or ingestion step writes 0 (or
+    an empty or failed value) into a numeric epoch field. It then converts to
+    1970-01-01. This is the most common cause. The value is really "missing",
+    but it looks like a valid date and slips past a null check.
+  - Unit mix-ups: a seconds value read as milliseconds, or the reverse. Seconds
+    treated as milliseconds land within days of 1970, for example 1.7e9 ms is
+    about 20 days after the epoch. Milliseconds treated as seconds land far in
+    the future, which the n_future check catches.
+  - Default or placeholder values: some sources use 1970-01-01 as a "no date"
+    sentinel, just as others use 1900-01-01 or 9999-12-31.
+
+  Why it gets its own count
+  These values hide from other checks:
+  - The null profile in section 2 counts them as populated.
+  - Any min() on the column gets dragged to 1970, which distorts the date range.
+  - Duration calculations, such as time between sitting start and end, will be
+    off by about 56 years.
+  - They would silently fall into the n_before_2000 bucket, which could be
+    mistaken for genuine old data. Keeping a separate count tells you whether
+    early dates come from this sentinel pattern or from real historical records.
+
+  Why the threshold is 1970-01-02
+  It's a day, not an exact match on the epoch instant. That also catches values
+  that landed on 1970-01-01 after a timezone shift. A real record from 1970 is
+  implausible for this dataset, so false positives should be negligible.
+
+  Overlap: every epoch-like row is also counted in n_before_2000, so
+  n_epoch_like is a subset of it. If n_epoch_like is non-zero, the next step is
+  to look at the raw rows to see whether the source stores 0, null, or a string.
+
+> <ide_opened_file>The user opened the file
+  c:\Users\tayla\OneDrive\Documents\GitZone\atom-learning-take-home-test-2026-1
+  0\sql_files\initial_investigation.sql in the IDE. This may or may not be
+  related to the current task.</ide_opened_file>
+
+> I have observed some data quality issues in the keys between responses and
+  assessment sittings - discrepancies in their keys. Looks like there are
+  responses that dont appear in assessment sittings. Write me a query to take a
+  quick look at this closer
+
+  Read 1 file (ctrl+o to expand)
+
+● I added section 8 to the end of initial_investigation.sql
+  (sql_files/initial_investigation.sql). It has three queries on PAIR B
+  (responses.session_id against assessment_sittings.session_id). I haven't run
+  any of them.
+
+  - 8a, size of the gap. It counts distinct session_ids that are in both tables,
+    only in responses, and only in sittings. The "only in sittings" count is
+    informational, since a sitting with no responses can be legitimate.
+  - 8b, one row per orphan session_id. It shows these columns:
+    - Size and ownership: n_responses, n_pupils and n_questions, plus the key
+      length.
+    - Formatting check: matches_after_normalising is true when the key matches a
+      sitting once trimmed and lower-cased. That would mean a formatting
+      problem. If it's false, the sitting is genuinely missing.
+  - 8c, key shape comparison. It turns letters into a and digits into 9, then
+    groups distinct response keys by pattern and by whether they were found in
+    sittings. A pattern that appears only on the orphan side points to a
+    different prefix, length or source system.
+
+  How to read the results
+  - If 8b shows matches_after_normalising = true, it's a key formatting problem.
+  - If the orphans have a different pattern in 8c, they likely come from another
+    source or format.
+  - If orphans are clean-looking keys with no near match, the sittings are
+    probably missing upstream. Pairs A and C already passed, so the orphan
+    responses still belong to valid pupils and questions.
+
+  Assumptions to check
+  - Normalisation: it is only trim and lower-case. Other mismatches, such as a
+    prefix or zero-padding, would show up in 8c but wouldn't be matched
+    automatically.
+  - Casting: I cast keys to string in 8b and 8c, so they work whatever the
+    column type is. Section 6 would have flagged a type mismatch between the two
+    tables.
+  - Cost: these scan only the key columns, plus pupil_id and question_id in 8b.
+    I haven't dry-run them.
+
+  If the orphans turn out to be concentrated in time or in particular pupils,
+  send me the responses timestamp column name and I'll add a time-distribution
+  cut.
+
+> <ide_opened_file>The user opened the file c:\Users\tayla\OneDrive\Documents\G
+  itZone\atom-learning-take-home-test-2026-10\README.md in the IDE. This may or
+  may not be related to the current task.</ide_opened_file>
+
+> Off the back of @sql_files/initial_investigation.sql  I am building a
+  production-grade data model (scaling to >100M response records). The
+  objective is to produce SATs scores (appropriately scaled 80-120 depending on
+  subject and session year) for every pupil in every subject. DQIs spotted so
+  far have been noted and may be read from @README.md .  The plan is to
+  implement three architectural layers to support the output - cleaning,
+  aggregating, and scoring layer
+
+  Context/requirements:
+  Step 1 - SATs score mapping. Group pupil question responses by the 7 subjects
+  listed in @sql_files/initial_investigation.sql . Exclude Wellbeing and
+  Screeners (non-academic) subjects from score mapping.  Derive the performance
+  metrics per pupil per subject using raw response rows:
+       * total_attempted = COUNT(response_id)
+       * correct_answers = COUNTIF(is_correct = TRUE)
+       * raw_percentage = SAFE_DIVIDE(correct_answers, total_attempted)
+  Map raw_percentage to the GOV UK 80-120 scale by creating a the linear fomula
+  such that:
+  - 0% raw percentage results in a rounded output of 80. This is the lowest
+  possible scales score
+  - 50% " results in a 100. This is the expected standard
+  - 100% " 120. This is the maximum possible score
+
+  Step 2 - Production-grade architecture
+  - filter out soft-deleted records and incomplete sittings using
+  pupils.is_deleted = FALSE, assessment_sittings.is_complete = TRUE,
+  assessment_sittings.is_deleted = FALSE
+  - Use create/replace syntax to make the runs indempotent
+  - use the started_at, finished_at (assessment_sittings), and answered_at
+  (responses) to implement 'snapshot_date' parameter and allow for
+  point-in-time snapshots
+  - materialise the final output partitioned by the DATE(snapshot_date) and
+  cluster by pupil_id and subject_id
+  - Include standard metadata columns - run_timestamp, primary keys
+
+  Please provide:
+  - Clean production SQL query to allow materialised 'pupil_sat_scores' in
+  BigQuery - include partitioning.
+  - Tidy up my architectural decisions in my README.
+  ⎿  Read sql_files\initial_investigation.sql (310 lines)
+  ⎿  Read README.md (35 lines)
+
+● User answered Claude's questions:
+  ⎿  · How should the table be materialised so it is idempotent AND keeps
+     multiple snapshots? CREATE OR REPLACE TABLE on its own would wipe every
+     other snapshot_date partition on each run. → Create-if-not-exists + replace
+     one partition (Recommended)
+     · Your brief says scaling depends on 'subject and session year', but the
+     formula given (0%→80, 50%→100, 100%→120) is identical for all. How should I
+     handle that? → Apologies, I failed to remove that during planning. Please
+     use one global formula for all of the relevant subjects
+     · I can't see the column names beyond keys. I plan to assume:
+     course_hierarchy(question_id, subject_id, subject_name);
+     responses(response_id, session_id, pupil_id, question_id, is_correct,
+     answered_at); assessment_sittings(session_id, pupil_id, is_complete,
+     is_deleted, started_at, finished_at); pupils(pupil_id, is_deleted). How do
+     you want to confirm? → please find the column names and datatypes in
+     @01_sats_score.sql comments
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Write(sql_files\02_pupil_sat_scores.sql)
+  ⎿  Wrote 136 lines to sql_files\02_pupil_sat_scores.sql
+      1 -- ==============================================================
+      2 -- pupil_sat_scores: scaled (80-120) score per pupil per academic
+         subject, as at a snapshot date.
+      4 -- Grain / primary key : (snapshot_date, pupil_id, subject_id)
+      5 -- Layers (as CTEs)    : 1. cleaning    - soft-deletes, incomplet
+      6 --                       2. aggregating - attempts / correct / ra
+        w percentage per pupil per subject
+        ntage onto the 80-120 scale
+      8 -- Idempotency         : re-running a snapshot_date deletes and r
+      9 -- Usage
+     … +159 lines (ctrl+o to expand)
+
+● Write(README.md)
+  ⎿  Added 64 lines, removed 18 lines
+       4  
+       5  ## Core Work
+       6  
+       7 -Break the architecture down into three layers:                 
+       8 -- Cleaning                                                     
+       9 -- Aggregating                                                  
+      10 -- Score scaling                                                
+       7 +The model is split into three layers, implemented as CTEs in [s
+         +ql_files/02_pupil_sat_scores.sql](sql_files/02_pupil_sat_scores
+         +.sql):                                                         
+       8  
+       9 +| Layer | Responsibility |                                     
+      10 +|---|---|                                                      
+      11 +| Cleaning | Remove soft-deleted pupils/sittings, incomplete si
+         +ttings, orphaned responses and non-academic subjects; apply the
+         + snapshot cut-off |                                            
+      12 +| Aggregating | `total_attempted`, `correct_answers` and `raw_p
+         +ercentage` per pupil per subject |                             
+      13 +| Score scaling | Map `raw_percentage` onto the 80-120 scale | 
+      14  
+      15 +Investigation queries that informed these decisions are in [sql
+         +_files/initial_investigation.sql](sql_files/initial_investigati
+         +on.sql).                                                       
+      16  
+      14 -## Considerations/Assumptions                                  
+      15 -- Of the seven subjects, only three are official SATs subjects.
+         - Options considered were to do one of the following:           
+      16 -    - Only apply scaling to the official subjects              
+      17 -    - Only apply it to academic subjects                       
+      18 -    - Only apply it to qualitative subjects                    
+      17  
+      20 -- Having taken a look at the scaled score conversions for 2025 
+         -and 2026, I had to make a judgement                            
+      21 -about the formula that I would use for Atom Learning assessment
+         -. As the national standard of 100 tends to sit at around 50% of
+         - the marks, I decided to opt for a formula that would anchor th
+         -is metric similarly. With 80 being the minimum scaled score, 0%
+         - performance can be mapped to it.                              
+      22 -`scaled_score = min(120, max(80,))                             
+      18 +## Architectural Decisions                                     
+      19  
+      24 -- Partitioning: Because bigquery scans the entire table, partit
+         -ioning is essential for production-grade efficiency and cost-ef
+         -fectiveness, particularly as the responses table is one that wi
+         -ll easily grow past 100M entries.                              
+      20 +### Scope: which subjects are scored                           
+      21 +Of the seven subjects, only three are official SATs subjects. T
+         +he options considered were to:                                 
+      22 +- apply scaling only to the official SATs subjects             
+      23 +- apply it only to academic subjects                           
+      24 +- apply it only to qualitative subjects                        
+      25  
+      26 -- Using the timestammps to create snapshot dates and ensure ide
+         -mpotency                                                       
+      26 +**Decision:** score every academic subject (Maths, English, Sci
+         +ence, Verbal Reasoning, Non-Verbal Reasoning) and exclude the n
+         +on-academic `Wellbeing` and `Screeners`.                       
+      27  
+      28 +### Scaling formula                                            
+      29 +Having looked at the 2025 and 2026 GOV.UK scaled score conversi
+         +ons, I chose a single linear formula for all subjects. The nati
+         +onal standard of 100 sits at roughly 50% of the marks, so the f
+         +ormula anchors on that:                                        
+      30 +                                                               
+      31 +| raw_percentage | scaled_score |                              
+      32 +|---|---|                                                      
+      33 +| 0% | 80 (lowest possible) |                                  
+      34 +| 50% | 100 (expected standard) |                              
+      35 +| 100% | 120 (highest possible) |                              
+      36 +                                                               
+      37 +`scaled_score = ROUND(LEAST(120, GREATEST(80, 80 + 40 * raw_per
+         +centage)))`                                                    
+      38 +                                                               
+      39 +### Grain and keys                                             
+      40 +One row per pupil per subject per snapshot. Primary key: `(snap
+         +shot_date, pupil_id, subject_id)`. BigQuery primary keys are no
+         +t enforced, so the script asserts uniqueness after writing each
+         + partition. Metadata column: `run_timestamp`.                  
+      41 +                                                               
+      42 +### Point-in-time snapshots                                    
+      43 +`snapshot_date` is a parameter. A row is included only if, by t
+         +he end of that day (UTC):                                      
+      44 +- the sitting had started (`started_at`) and finished (`finishe
+         +d_at`), and                                                    
+      45 +- the response had been answered (`answered_at`).              
+      46 +                                                               
+      47 +Scores are therefore cumulative as at the snapshot date.       
+      48 +                                                               
+      49 +### Idempotency                                                
+      50 +The target table is created with `CREATE TABLE IF NOT EXISTS`. 
+         +Each run then deletes and re-inserts only its own `snapshot_dat
+         +e` partition in a single transaction. Re-running a date gives t
+         +he same rows and leaves other snapshots untouched. A plain `CRE
+         +ATE OR REPLACE TABLE` was rejected because it would overwrite e
+         +very other snapshot with the latest run.                       
+      51 +                                                               
+      52 +### Partitioning and clustering                                
+      53 +- **Partitioned by `snapshot_date`.** BigQuery bills by bytes s
+         +canned, so partitioning keeps reads and per-snapshot rewrites c
+         +heap. This matters because `responses` will comfortably exceed 
+         +100M rows.                                                     
+      54 +- **Clustered by `pupil_id`, `subject_id`** to prune on the mos
+         +t common lookups.                                              
+      55 +                                                               
+      56 +### Filters applied in cleaning                                
+      57 +- `pupils.is_deleted = FALSE`                                  
+      58 +- `assessment_sittings.is_deleted = FALSE` and `is_complete = T
+         +RUE`                                                           
+      59 +- Responses with no matching sitting are dropped by the inner j
+         +oin (see DQIs).                                                
+      60 +                                                               
+      61 +                                                               
+      62  ## Data Quality Issues (DQIs)
+      29 -- Discrepancy between IDs in `responses` and `assessment_sittin
+         -gs` tables                                                     
+      63 +- **Orphaned responses:** `responses.session_id` contains value
+         +s that do not exist in `assessment_sittings.session_id`. These 
+         +responses cannot be tied to a complete, non-deleted sitting, so
+         + they are excluded from scoring. See section 8 of `initial_inve
+         +stigation.sql` for queries that size and profile them.         
+      64  
+      65 +Checks that came back clean:                                   
+      66 +- Primary keys are unique in every table.                      
+      67 +- There are no fully duplicated rows.                          
+      68 +- There are no null, blank or sentinel-text values in STRING co
+         +lumns.                                                         
+      69 +- Foreign keys are intact for `responses.pupil_id`, `responses.
+         +question_id` and `assessment_sittings.pupil_id`.               
+      70 +- Timestamps fall between Nov 2025 and Sep 2026, with no future
+         +-dated or epoch-like values.                                   
+      71  
+      72 +                                                               
+      73 +## Open Questions                                              
+      74 +- `total_attempted` is `COUNT(response_id)` as specified, so ro
+         +ws flagged `is_no_attempt` count as attempts. Excluding them wo
+         +uld change every score; confirm the intended behaviour.        
+      75 +                                                               
+      76 +                                                               
+      77  ## What I would have done with more time
+      33 -- Provided more specific details on the DQIs and sample queries
+         - to view them (rather than attaching the IDs to the README).   
+      34 -- Visually fleshed out the architecture further using a tool li
+         -ke Excalidraw or LucidChart                                    
+      35 -- Explored more optimisation techniques for columnar data.     
+      78   No newline at end of file
+      79 +- Provided more specific details on the DQIs and sample queries
+         + to view them (rather than attaching IDs to the README).       
+      80 +- Visually fleshed out the architecture further using a tool li
+         +ke Excalidraw or Lucidchart.                                   
+      81 +- Explored more optimisation techniques for columnar data.     
+      82 +- Materialised each layer as its own table or view, and moved s
+         +cale parameters into a config table.                           
+
+● Update(README.md)
+  ⎿  Added 3 lines, removed 2 lines
+      65  Checks that came back clean:
+      66  - Primary keys are unique in every table.
+      67  - There are no fully duplicated rows.
+      68 -- There are no null, blank or sentinel-text values in STRING co
+         -lumns.                                                         
+      68 +- There are no blank, sentinel-text or padded values in STRING 
+         +columns.                                                       
+      69 +- There are no temporal values stored as STRING.               
+      70  - Foreign keys are intact for `responses.pupil_id`, `responses.
+          question_id` and `assessment_sittings.pupil_id`.
+      70 -- Timestamps fall between Nov 2025 and Sep 2026, with no future
+         --dated or epoch-like values.                                   
+      71 +- Timestamps fall between Nov 2025 and Sep 2026.               
+      72  
+      73  
+      74  ## Open Questions
+
+● I wrote the production script as sql_files/02_pupil_sat_scores.sql and rewrote
+  the README.md. I haven't run the script or dry-run it, so please dry-run it
+  before the first execution.
+
+  How the script works
+  - Layers: cleaning, aggregating and scoring are three labelled CTEs in one
+    script. I didn't split them into separate tables.
+  - Idempotency: CREATE TABLE IF NOT EXISTS creates the table, partitioned by
+    snapshot_date and clustered by pupil_id, subject_id. Each run then deletes
+    and re-inserts only its own partition in one transaction.
+  - Primary key: it is (snapshot_date, pupil_id, subject_id), unenforced, so an
+    ASSERT checks it is unique after each write. If the assert fails, the
+    transaction rolls back.
+  - Scale: ROUND(80 + 40 * raw_percentage), clamped to 80–120. The anchors are
+    declared variables at the top of the script.
+  - Snapshots: a row counts only if started_at, finished_at and answered_at are
+    all before the end of p_snapshot_date (UTC).
+  - Variable name: the variable is p_snapshot_date, not snapshot_date. A
+    variable with the column's name would make DELETE ... WHERE snapshot_date =
+    snapshot_date match every row and wipe the table.
+  - Orphans: responses with no matching sitting are dropped by the inner join to
+    cleaned sittings.
+
+  Please confirm or change
+  - Output dataset: I used de_model as a guess. It must exist, and you need
+    write access to it.
+  - is_no_attempt: I followed your spec, so total_attempted = COUNT(response_id)
+    counts rows flagged is_no_attempt. Excluding them would change every score.
+    I put this under Open Questions in the README.
+  - Subject filter: it excludes by subject_name ('Wellbeing', 'Screeners'), so a
+    renamed subject would slip through.
+  - Pupil attribution: the pupil comes from assessment_sittings.pupil_id, not
+    responses.pupil_id. I haven't checked that the two always agree.
+  - Cost: responses isn't partitioned in de_raw, so every snapshot run scans the
+    columns it reads from that table in full. Partitioning only keeps reads and
+    rewrites of the output cheap.
+  - Partition filter: I didn't set require_partition_filter. It's a one-line
+    addition if you want it.
+
+  README changes
+  - Fixes: your broken formula line is fixed, and the layers, scope, scaling,
+    keys, snapshots, idempotency and partitioning are written up as decisions.
+  - DQIs: I recorded the checks you noted as clean. I left out the null-profile
+    result because you hadn't noted it, so tell me what it showed if you want it
+    added.
+
+> <ide_opened_file>The user opened the file
+  c:\Users\tayla\OneDrive\Documents\GitZone\atom-learning-take-home-test-2026-1
+  0\sql_files\initial_investigation.sql in the IDE. This may or may not be
+  related to the current task.</ide_opened_file>
+
+> 1) I have replaced the output dataset accordingly. 2) As for the open
+  question, I confirm the logic to include is_no_attempt in total questions. A
+  student skipping hald the paper and getting the answered half fully correct
+  should not be awarded 100% equivalent. Add this to the Readme assumptions 3)
+  Please make the subject names case-insensitive using UPPER(). If I had more
+  time I would create a lookup table for the subjects to be referenced against
+  and add automated data quality tests - please add this to this section of my
+  README 4) I checked for mismatched ids (see lines 312-320 in
+  @sql_files/initial_investigation.sql  - no mismatch.  5) I accept this - the
+  source table is unpartitioned to full-column scans will initially be
+  performed. We parition downstream to stay as cost-efficient as possible
+  (please add this to README) 6) Yes please enable to avoid accidental full
+  scans. Please add this logic to readme.
+  ⎿  Read sql_files\initial_investigation.sql (320 lines)
+
+● Update(sql_files\02_pupil_sat_scores.sql)
+  ⎿  Added 1 line, removed 1 line
+      72        subject_id,
+      73        subject_name
+      74      from `atom-analytics-candidates.de_raw.course_hierarchy`
+      75 -    where subject_name not in ('Wellbeing', 'Screeners')       
+      75 +    where upper(subject_name) not in ('WELLBEING', 'SCREENERS')
+      76    ),
+      77  
+      78    -- The inner join to clean_sittings also drops responses whos
+          e session_id has no sitting (known orphans).
+
+● Update(sql_files\02_pupil_sat_scores.sql)
+  ⎿  Added 4 lines, removed 1 line
+      37  )
+      38  partition by snapshot_date
+      39  cluster by pupil_id, subject_id
+      40 -options (description = 'Scaled score (80-120) per pupil per aca
+         -demic subject, one partition per snapshot_date');              
+      40 +options (                                                      
+      41 +  description = 'Scaled score (80-120) per pupil per academic s
+         +ubject, one partition per snapshot_date',                      
+      42 +  require_partition_filter = true  -- queries must filter on sn
+         +apshot_date, preventing accidental full scans                  
+      43 +);                                                             
+      44  
+      45  
+      46  begin transaction;
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(README.md)
+  ⎿  Added 3 lines
+      52  ### Partitioning and clustering
+      53  - **Partitioned by `snapshot_date`.** BigQuery bills by bytes s
+          canned, so partitioning keeps reads and per-snapshot rewrites c
+          heap. This matters because `responses` will comfortably exceed 
+          100M rows.
+      54  - **Clustered by `pupil_id`, `subject_id`** to prune on the mos
+          t common lookups.
+      55 +- **Source is unpartitioned.** The raw tables in `de_raw` are n
+         +ot partitioned, so each snapshot run performs full-column scans
+         + of the columns it reads. We accept that cost at source and par
+         +tition downstream so everything built on top stays as cost-effi
+         +cient as possible.                                             
+      56 +- **`require_partition_filter = TRUE`** on the output table. An
+         +y query against `pupil_sat_scores` must filter on `snapshot_dat
+         +e`, which prevents accidental full-table scans. The script's ow
+         +n `DELETE` and assert filter on `snapshot_date`, so they are un
+         +affected.                                                      
+      57  
+      58  ### Filters applied in cleaning
+      59 +- `UPPER(subject_name)` is not `'WELLBEING'` or `'SCREENERS'`, 
+         +so the exclusion is case-insensitive.                          
+      60  - `pupils.is_deleted = FALSE`
+      61  - `assessment_sittings.is_deleted = FALSE` and `is_complete = T
+          RUE`
+      62  - Responses with no matching sitting are dropped by the inner j
+          oin (see DQIs).
+
+● Update(README.md)  ⎿  Added 1 line
+      71  - There are no blank, sentinel-text or padded values in STRING 
+          columns.
+      72  - There are no temporal values stored as STRING.
+      73  - Foreign keys are intact for `responses.pupil_id`, `responses.
+          question_id` and `assessment_sittings.pupil_id`.
+      74 +- `responses.pupil_id` matches `assessment_sittings.pupil_id` o
+         +n every joined row, so the pupil can safely be taken from the s
+         +itting.                                                        
+      75  - Timestamps fall between Nov 2025 and Sep 2026.
+      76  
+      77  
+
+● Update(README.md)
+  ⎿  Added 2 lines, removed 2 lines
+      75  - Timestamps fall between Nov 2025 and Sep 2026.
+      76  
+      77  
+      78 -## Open Questions                                              
+      79 -- `total_attempted` is `COUNT(response_id)` as specified, so ro
+         -ws flagged `is_no_attempt` count as attempts. Excluding them wo
+         -uld change every score; confirm the intended behaviour.        
+      78 +## Assumptions                                                 
+      79 +- **`is_no_attempt` rows count towards `total_attempted`.** `to
+         +tal_attempted` is `COUNT(response_id)`, so skipped questions st
+         +ay in the denominator. A pupil who skips half the paper and get
+         +s the answered half fully correct should not be awarded the equ
+         +ivalent of 100%.                                               
+      80  
+      81  
+      82  ## What I would have done with more time
+
+● Update(README.md)
+  ⎿  Added 2 lines
+      84  - Visually fleshed out the architecture further using a tool li
+          ke Excalidraw or Lucidchart.
+      85  - Explored more optimisation techniques for columnar data.
+      86  - Materialised each layer as its own table or view, and moved s
+          cale parameters into a config table.
+      87 +- Created a lookup table of subjects to reference against, repl
+         +acing the hard-coded subject name exclusions.                  
+      88 +- Added automated data quality tests, for example key uniquenes
+         +s, orphan checks and score range checks.                       
+
+● I've made all six changes in 02_pupil_sat_scores.sql
+  (sql_files/02_pupil_sat_scores.sql) and README.md. I haven't run or dry-run
+  the script.
+
+  SQL
+  - Case-insensitive subjects (3): the filter is now upper(subject_name) not in
+    ('WELLBEING', 'SCREENERS').
+  - Partition filter (6): require_partition_filter = true is added to the table
+    options. The script's own DELETE and ASSERT filter on snapshot_date, so they
+    still work.
+  - is_no_attempt (2): no SQL change was needed, because COUNT(response_id)
+    already keeps skipped questions in the denominator.
+  - Existing table: if pupil_sat_scores already exists, CREATE TABLE IF NOT
+    EXISTS won't apply the new option. Run ALTER TABLE ... SET OPTIONS
+    (require_partition_filter = true) once, or drop the table and let the script
+    recreate it.
+  - Your other edits: the file had changed on disk since I wrote it. My edits
+    applied cleanly, and I did not read or revert your other changes.
+
+  README
+  - Assumptions (2): the Open Questions section is now an Assumptions section.
+    It records that is_no_attempt rows count towards total_attempted, with your
+    reasoning.
+  - More time (3): it now lists a subject lookup table, which would replace the
+    hard-coded exclusions, and automated data quality tests.
+  - Source scans (5): the Partitioning section notes that the unpartitioned
+    source means full-column scans, and that we partition downstream to keep
+    costs down.
+  - Partition filter (6): it explains require_partition_filter.
+  - Pupil IDs (4): I added your pupil ID check to the clean-checks list. It
+    confirms that taking pupil_id from the sitting is safe.
+  - Subject filter: the Filters section now describes the UPPER() exclusion.
+
+> <ide_selection>The user selected the lines 82 to 85 from c:\Users\tayla\OneDr
+  ive\Documents\GitZone\atom-learning-take-home-test-2026-10\README.md:
+  Step 3 - Explanation
+
+  Explain how you might predict a pupil's GCSE results from their
+  primary-school work. Tell us what you would need to build that - what data,
+  what assumptions and why. A few paragraphs is a complete answer
+
+  This may or may not be related to the current task.</ide_selection>
+
+> We are tasked with Step 3 (see lines 82-85 in @README.md ). I have given some
+  high level points about how I would approach this. How could it be improved
+  from a data engineering and long-term perspective?
+  ⎿  Read README.md (111 lines)
+
+● Your direction is sound. The main gaps are the label problem, which data you
+  can legitimately use, and some data engineering points that are specific to
+  prediction. "A few paragraphs" is the brief, so I'd keep the final README
+  answer short and prioritise the first four items below.
+
+  Highest value to add
+  1. The label lags by about five years. GCSE outcomes arrive five years after
+     KS2, and your platform data starts in Nov 2025. So you can't train on your
+     own data yet. Say how you'd bootstrap:
+     - Start from public DfE KS2-to-GCSE progress data, such as transition
+       matrices and Attainment 8 and Progress 8 benchmarks, as the prior.
+     - Calibrate with your own cohorts as outcomes arrive.
+     - Your Bayesian choice fits here, because the prior carries the model until
+       your own labels exist. Say that explicitly as the reason for it.
+  2. How you get the outcomes. You need a way to link pupils to GCSE results,
+     for example school MIS or DfE data sharing, with a stable pupil identifier
+     across years and schools. This is a bigger risk than the modelling, and a
+     strong answer names it.
+  3. Bias and representativeness. Platform users are self-selected and more
+     motivated than average, and engagement correlates with outcome without
+     necessarily causing it. Name that, and say you'd check calibration by
+     subgroup (for example FSM, EAL, SEN) before anyone acts on a prediction.
+  4. Baseline first. Fit a simple regression of GCSE outcome on KS2 prior
+     attainment, then show the Bayesian hierarchical model (pupil within school
+     within cohort) has to beat it. "Non-linear learning" is currently an
+     assumption, so treat it as a hypothesis to test.
+
+  Data engineering and long-term points
+  - True point-in-time snapshots. Your current pipeline filters on event time
+    only, and it reads soft-deletes and sitting status as they are today. A
+    snapshot re-run for an old date can therefore differ from what you would
+    have seen then, which is a quiet look-ahead leak.
+    - The fix is to record when data landed (ingested_at) and when a deletion
+      happened, so snapshots can be rebuilt as-known-at.
+    - This is the sharpest point linking Step 3 to your own model.
+  - Scores are versioned and reproducible. Your 80–120 scale is a proprietary
+    approximation of the official one. Store raw_percentage alongside the score
+    and keep the conversion in a versioned config table, so a formula change
+    doesn't silently rewrite history. You already list the config table under
+    more time.
+  - Targets that survive grade boundary changes. Predict a relative measure,
+    such as percentile or residual against expectation, then map it to a grade.
+    Boundaries shift every year.
+  - Output you can audit.
+    - Predictions should be a distribution with credible intervals, not a single
+      grade.
+    - Write them to a partitioned table that carries model_version and
+      run_timestamp, like your score table.
+    - Keep training-set builds versioned.
+  - Evaluation and monitoring.
+    - Use temporal splits, not random ones, so there's no leakage.
+    - Retrain when GCSE results land each August.
+    - Monitor calibration and drift as real outcomes come in.
+  - Data contracts and tests at ingestion. The orphaned session_ids you found
+    would silently bias the features. This is also where your automated DQ tests
+    belong.
+  - Cold start. Pupils with no KS2 baseline, such as new joiners or those from
+    private schools, fall back to the cohort prior. A Bayesian model handles
+    this naturally.
+  - Governance. This is children's data, so cover lawful basis, retention,
+    minimisation and pseudonymisation. Also say how predictions are used: as
+    guidance for teachers, not labels on pupils.
+
+  Smaller edits to your current text
+  - "The curriculum remains the same" is probably false over five years. Restate
+    it as "curriculum changes are tracked and mapped to a stable topic
+    taxonomy".
+  - Data requirements should name the unit of data, such as per-topic mastery
+    over time, not just "plenty of data".
+  - Fix the typos ("engagemen", "demonstable") and the missing space in "-The
+    curriculum".
+
+  I can rewrite the Step 3 section with these points, in a few tight paragraphs,
+  if you'd like.
+
+> <ide_opened_file>The user opened the file c:\Users\tayla\OneDrive\Documents\G
+  itZone\atom-learning-take-home-test-2026-10\README.md in the IDE. This may or
+  may not be related to the current task.</ide_opened_file>
+
+> You are right in that curricula are unlikely to remain identical, however in
+  my my experience, the topics that qualify the upper end are largely the same
+  and I would like to reflect this. Please update this portion of my README
+  accordingly. I agree about the Progress/Attainment 8 benchmarks. The rest of
+  your new points can be omitted until I consider them more.
+
+● Update(README.md)
+  ⎿  Error editing file
+
+● Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+       95  - Non-linear student learning trajectories.
+       96  
+       97  ### Approach
+       98 -Due to the assumtion of non-linear learning, I would use Bayes
+          -ian updating as my underpinning method. I would use historical
+          - data of a student's KS2 results as a baseline for the model a
+          -nd the continuous activity on the platform as observation data
+          -. This approach allows for a continuously updating distributio
+          -n system to model. Snapshotting would be maintained to prevent
+          - any look-ahead bias.                                         
+       98 +Due to the assumtion of non-linear learning, I would use Bayes
+          +ian updating as my underpinning method. I would use historical
+          + data of a student's KS2 results as a baseline for the model a
+          +nd the continuous activity on the platform as observation data
+          +. The prior would come from the published DfE Progress 8 and A
+          +ttainment 8 benchmarks, which describe typical KS2-to-GCSE pro
+          +gress, so the model is usable before enough of our own pupils 
+          +have reached GCSE. It would then be calibrated against our own
+          + cohorts as their outcomes arrive. This approach allows for a 
+          +continuously updating distribution system to model. Snapshotti
+          +ng would be maintained to prevent any look-ahead bias.        
+       99  
+      100  
+      101  ## What I would have done with more time
+
+● Update(README.md)
+  ⎿  Error editing file
+
+● The file changed on disk, so I'll re-read that section.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      91  - Continuous stream of engagement data from the platform.
+      92  
+      93  ### Assumptions
+      94 -- The curriculum remains the same. Mastery is approximately mea
+         -sured by demonstrable comprehension of the same topics.        
+      94 +- The curriculum will not stay identical, but the topics that d
+         +istinguish upper-end attainment are largely stable over time. M
+         +astery is approximately measured by demonstrable comprehension 
+         +of those core topics, so the model leans on them rather than on
+         + the full curriculum.                                          
+      95  - Non-linear student learning trajectories.
+      96  
+      97  ### Approach
+
+● Update(README.md)
+  ⎿  Added 1 line
+      89  - Plenty of prior attainment data of students from diverse acad
+          emic backgrounds.
+      90  - Any data scaling metric used at either levels.
+      91  - Continuous stream of engagement data from the platform.
+      92 +- Published DfE Progress 8 and Attainment 8 benchmarks, to use 
+         +as the prior.                                                  
+      93  
+      94  ### Assumptions
+      95  - The curriculum will not stay identical, but the topics that d
+          istinguish upper-end attainment are largely stable over time. M
+          astery is approximately measured by demonstrable comprehension 
+          of those core topics, so the model leans on them rather than on
+           the full curriculum.
+
+● I've updated the Step 3 section of README.md with your curriculum point and
+  the Progress 8 and Attainment 8 prior, and left out the other suggestions.
+
+  - Curriculum assumption: it now says the curriculum won't stay identical, but
+    the topics that distinguish upper-end attainment are largely stable. Mastery
+    is therefore measured on those core topics rather than the full curriculum.
+  - Data requirements: I added "Published DfE Progress 8 and Attainment 8
+    benchmarks, to use as the prior."
+  - Approach: I added two sentences. The benchmarks form the prior, so the model
+    is usable before enough of your own pupils have reached GCSE. It is then
+    calibrated against your own cohorts as their outcomes arrive.
+
+  The Approach paragraph still contains the typo "assumtion". The data
+  requirements bullet "Any data scaling metric used at either levels" is also
+  unchanged. I left both alone because you only asked for this portion.
